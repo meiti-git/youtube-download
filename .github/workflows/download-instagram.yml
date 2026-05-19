@@ -1,4 +1,4 @@
-name: Instagram Downloader
+name: Instagram Downloader (بدون کوکی - نسخه نهایی)
 
 on:
   workflow_dispatch:
@@ -58,35 +58,16 @@ jobs:
             fi
           done
 
-      - name: Setup Deno
-        uses: denoland/setup-deno@v2
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          deno-version: v2.x
+          python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install parth-dl
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg zip curl jq bc
-          pip3 install --upgrade yt-dlp
+          pip install parth-dl
 
-      - name: Setup Cookies
-        env:
-          INSTA_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
-        run: |
-          if [ -n "$INSTA_COOKIES" ]; then
-            # ذخیره کوکی به صورت مستقیم (همون فرمتی که داری)
-            cat > /tmp/cookies.txt << 'EOFCOOKIES'
-            $INSTA_COOKIES
-            EOFCOOKIES
-            echo "✅ Cookies saved to /tmp/cookies.txt"
-            echo "COOKIES_FILE=/tmp/cookies.txt" >> "$GITHUB_ENV"
-            # بررسی خط اول کوکی
-            head -1 /tmp/cookies.txt
-          else
-            echo "⚠️ No cookies found in INSTAGRAM_COOKIES secret"
-          fi
-
-      - name: Download Instagram Post/Reel
+      - name: Download Instagram Post/Reel with parth-dl
         run: |
           URL="${{ github.event.inputs.instagram_url }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
@@ -100,88 +81,44 @@ jobs:
 
           echo "========================================="
           echo "Downloading Instagram: $URL"
+          echo "Using parth-dl (No login required)"
           echo "========================================="
 
-          # استفاده از کوکی اگر وجود داشت
-          COOKIE_ARG=""
-          if [ -f "/tmp/cookies.txt" ]; then
-            COOKIE_ARG="--cookies /tmp/cookies.txt"
-            echo "✅ Using cookies from file"
+          # استفاده از parth-dl برای دانلود
+          # parth-dl به صورت خودکار بهترین کیفیت رو انتخاب می‌کنه [citation:1]
+          cd tmp_downloads
+          
+          # دانلود با parth-dl
+          parth-dl "$URL"
+          
+          # بررسی نتیجه دانلود
+          if [ $? -eq 0 ]; then
+            echo "✅ Download successful!"
           else
-            echo "⚠️ No cookies file, trying without..."
-          fi
-
-          urlencode() {
-            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
-          }
-
-          # دانلود با روش‌های مختلف
-          DOWNLOAD_SUCCESS=false
-          
-          # روش 1: با کوکی و پروکسی
-          echo "Method 1: With cookies and WARP proxy..."
-          if yt-dlp --proxy "socks5://127.0.0.1:1080" \
-            $COOKIE_ARG \
-            --no-playlist \
-            --format "best[ext=mp4]/best" \
-            --output "tmp_downloads/%(title)s_%(id)s.%(ext)s" \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36" \
-            --add-header "Accept-Language: en-US,en;q=0.9" \
-            --sleep-requests 2 \
-            --retries 5 \
-            "$URL"; then
-            DOWNLOAD_SUCCESS=true
-            echo "✅ Method 1 succeeded!"
-          fi
-          
-          # روش 2 اگر روش اول失敗 کرد
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then
-            echo "Method 2: With cookies, WARP proxy and mobile user-agent..."
-            if yt-dlp --proxy "socks5://127.0.0.1:1080" \
-              $COOKIE_ARG \
+            echo "❌ parth-dl failed, trying with yt-dlp as fallback..."
+            # fallback به yt-dlp از طریق پروکسی WARP
+            yt-dlp --proxy "socks5://127.0.0.1:1080" \
               --no-playlist \
               --format "best" \
-              --output "tmp_downloads/%(title)s_%(id)s.%(ext)s" \
-              --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15" \
-              --extractor-args "instagram:api" \
-              "$URL"; then
-              DOWNLOAD_SUCCESS=true
-              echo "✅ Method 2 succeeded!"
-            fi
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36" \
+              "$URL"
           fi
           
-          # روش 3: بدون پروکسی فقط با کوکی
-          if [ "$DOWNLOAD_SUCCESS" = false ] && [ -n "$COOKIE_ARG" ]; then
-            echo "Method 3: Without proxy, only cookies..."
-            if yt-dlp \
-              $COOKIE_ARG \
-              --no-playlist \
-              --format "best" \
-              --output "tmp_downloads/%(title)s_%(id)s.%(ext)s" \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "$URL"; then
-              DOWNLOAD_SUCCESS=true
-              echo "✅ Method 3 succeeded!"
-            fi
-          fi
-
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then
-            echo "❌ All download methods failed!"
-            echo "Files in tmp_downloads:"
-            ls -la tmp_downloads/ 2>/dev/null || echo "No files"
-          else
-            echo "✅ Download completed successfully!"
-          fi
+          cd ..
 
           echo ""
           echo "Files downloaded:"
           ls -la tmp_downloads/
           echo ""
 
-          # پردازش فایل‌های دانلود شده
+          # پردازش فایل‌های دانلود شده (ادامه مثل قبل)
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
 
           get_random_word() { 
             WORDS=(alpha beta gamma delta zeta theta lambda sigma omega nova star moon sun sky cloud)
@@ -204,7 +141,7 @@ jobs:
 
           > /tmp/folder_map.txt
 
-          if [ -d "tmp_downloads" ] && [ "$(ls -A tmp_downloads 2>/dev/null | grep -v '\.json$\|\.part$\|\.ytdl$\|\.temp$')" ]; then
+          if [ -d "tmp_downloads" ] && [ "$(ls -A tmp_downloads 2>/dev/null)" ]; then
             for FILE in tmp_downloads/*; do
               [ -f "$FILE" ] || continue
               # رد کردن فایل‌های موقت و متادیتا
@@ -315,7 +252,6 @@ jobs:
 
           BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
           
-          # پیدا کردن فایل‌های دانلود شده
           if [ -d "$BACKUP_DIR" ] && [ "$(ls -A $BACKUP_DIR)" ]; then
             FIRST_FOLDER=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
             if [ -n "$FIRST_FOLDER" ]; then
