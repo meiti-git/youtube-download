@@ -1,4 +1,4 @@
-name: Instagram Downloader (با کوکی)
+name: Instagram Downloader
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ on:
         description: 'رمز عبور برای فایل‌های zip (اختیاری)'
         required: false
         default: ''
+        type: string
 
 jobs:
   download-instagram:
@@ -25,70 +26,342 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Install yt-dlp
+      - name: Start WARP Container
         run: |
-          pip install --upgrade yt-dlp
-          yt-dlp -U  # آپدیت به آخرین نسخه
+          echo "Starting Cloudflare WARP container..."
+          docker network create warp-net || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP to initialize (30 seconds)..."
+          sleep 30
+
+          echo "Checking WARP status..."
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 \
+              https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              echo "$RESULT"
+              break
+            else
+              echo "Attempt $i/10 — WARP not ready yet, waiting..."
+              sleep 10
+            fi
+          done
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg zip curl jq bc
+          pip3 install --upgrade yt-dlp
 
       - name: Setup Cookies
         env:
-          INSTAGRAM_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
+          INSTA_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
         run: |
-          if [ -n "$INSTAGRAM_COOKIES" ]; then
-            echo "$INSTAGRAM_COOKIES" > /tmp/cookies.txt
+          if [ -n "$INSTA_COOKIES" ]; then
+            # ذخیره کوکی به صورت مستقیم (همون فرمتی که داری)
+            cat > /tmp/cookies.txt << 'EOFCOOKIES'
+            $INSTA_COOKIES
+            EOFCOOKIES
+            echo "✅ Cookies saved to /tmp/cookies.txt"
             echo "COOKIES_FILE=/tmp/cookies.txt" >> "$GITHUB_ENV"
-            echo "Cookies configured successfully"
+            # بررسی خط اول کوکی
+            head -1 /tmp/cookies.txt
           else
-            echo "WARNING: No cookies found! Download may fail."
+            echo "⚠️ No cookies found in INSTAGRAM_COOKIES secret"
           fi
 
       - name: Download Instagram Post/Reel
         run: |
           URL="${{ github.event.inputs.instagram_url }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
-          
-          mkdir -p downloads/instagram
-          cd downloads/instagram
-          
-          echo "Downloading: $URL"
-          
-          # ساخت آرگومان‌های yt-dlp
-          COOKIES_ARGS=""
-          if [ -n "${COOKIES_FILE:-}" ] && [ -f "${COOKIES_FILE:-/dev/null}" ]; then
-            COOKIES_ARGS="--cookies $COOKIES_FILE"
+          SPLIT_MB=90
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          BACKUP_DIR="/tmp/instagram_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+          mkdir -p instagram tmp_downloads
+
+          echo "========================================="
+          echo "Downloading Instagram: $URL"
+          echo "========================================="
+
+          # استفاده از کوکی اگر وجود داشت
+          COOKIE_ARG=""
+          if [ -f "/tmp/cookies.txt" ]; then
+            COOKIE_ARG="--cookies /tmp/cookies.txt"
+            echo "✅ Using cookies from file"
+          else
+            echo "⚠️ No cookies file, trying without..."
           fi
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          # دانلود با روش‌های مختلف
+          DOWNLOAD_SUCCESS=false
           
-          # تلاش با روش‌های مختلف
-          yt-dlp \
-            $COOKIES_ARGS \
+          # روش 1: با کوکی و پروکسی
+          echo "Method 1: With cookies and WARP proxy..."
+          if yt-dlp --proxy "socks5://127.0.0.1:1080" \
+            $COOKIE_ARG \
             --no-playlist \
-            --format "best" \
-            --output "%(title)s_%(id)s.%(ext)s" \
+            --format "best[ext=mp4]/best" \
+            --output "tmp_downloads/%(title)s_%(id)s.%(ext)s" \
             --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36" \
             --add-header "Accept-Language: en-US,en;q=0.9" \
-            --retries 5 \
             --sleep-requests 2 \
-            "$URL" || {
-              echo "Method 1 failed, trying method 2..."
-              yt-dlp \
-                $COOKIES_ARGS \
-                --no-playlist \
-                --format "best" \
-                --output "%(title)s_%(id)s.%(ext)s" \
-                --extractor-args "instagram:api" \
-                "$URL"
-            }
+            --retries 5 \
+            "$URL"; then
+            DOWNLOAD_SUCCESS=true
+            echo "✅ Method 1 succeeded!"
+          fi
           
-          echo "Download complete!"
+          # روش 2 اگر روش اول失敗 کرد
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "Method 2: With cookies, WARP proxy and mobile user-agent..."
+            if yt-dlp --proxy "socks5://127.0.0.1:1080" \
+              $COOKIE_ARG \
+              --no-playlist \
+              --format "best" \
+              --output "tmp_downloads/%(title)s_%(id)s.%(ext)s" \
+              --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15" \
+              --extractor-args "instagram:api" \
+              "$URL"; then
+              DOWNLOAD_SUCCESS=true
+              echo "✅ Method 2 succeeded!"
+            fi
+          fi
           
-      - name: List files
-        run: |
+          # روش 3: بدون پروکسی فقط با کوکی
+          if [ "$DOWNLOAD_SUCCESS" = false ] && [ -n "$COOKIE_ARG" ]; then
+            echo "Method 3: Without proxy, only cookies..."
+            if yt-dlp \
+              $COOKIE_ARG \
+              --no-playlist \
+              --format "best" \
+              --output "tmp_downloads/%(title)s_%(id)s.%(ext)s" \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "$URL"; then
+              DOWNLOAD_SUCCESS=true
+              echo "✅ Method 3 succeeded!"
+            fi
+          fi
+
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "❌ All download methods failed!"
+            echo "Files in tmp_downloads:"
+            ls -la tmp_downloads/ 2>/dev/null || echo "No files"
+          else
+            echo "✅ Download completed successfully!"
+          fi
+
+          echo ""
           echo "Files downloaded:"
-          ls -la downloads/instagram/
+          ls -la tmp_downloads/
+          echo ""
+
+          # پردازش فایل‌های دانلود شده
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          get_random_word() { 
+            WORDS=(alpha beta gamma delta zeta theta lambda sigma omega nova star moon sun sky cloud)
+            echo "${WORDS[$RANDOM % ${#WORDS[@]}]}_$RANDOM"
+          }
+
+          get_unique_folder() {
+            local BASE_PATH="$1" NAME="$2"
+            CLEAN_NAME=$(echo "$NAME" | sed 's/[^a-zA-Z0-9_\-]/_/g' | cut -c1-50)
+            if [ ! -d "$BASE_PATH/$CLEAN_NAME" ] && [ ! -d "$BACKUP_DIR/$CLEAN_NAME" ]; then
+              echo "$CLEAN_NAME"
+              return
+            fi
+            local SUFFIX=$(get_random_word)
+            while [ -d "$BASE_PATH/${CLEAN_NAME}_${SUFFIX}" ] || [ -d "$BACKUP_DIR/${CLEAN_NAME}_${SUFFIX}" ]; do
+              SUFFIX=$(get_random_word)
+            done
+            echo "${CLEAN_NAME}_${SUFFIX}"
+          }
+
+          > /tmp/folder_map.txt
+
+          if [ -d "tmp_downloads" ] && [ "$(ls -A tmp_downloads 2>/dev/null | grep -v '\.json$\|\.part$\|\.ytdl$\|\.temp$')" ]; then
+            for FILE in tmp_downloads/*; do
+              [ -f "$FILE" ] || continue
+              # رد کردن فایل‌های موقت و متادیتا
+              case "$FILE" in *.json|*.part|*.ytdl|*.temp) continue ;; esac
+
+              SIZE=$(stat -c%s "$FILE")
+              BASENAME=$(basename "$FILE")
+              FILENAME_NO_EXT="${BASENAME%.*}"
+              EXT="${BASENAME##*.}"
+
+              echo "Processing: $BASENAME (Size: $(( SIZE / 1024 / 1024 )) MB)"
+
+              FINAL_FOLDER_NAME=$(get_unique_folder "instagram" "$FILENAME_NO_EXT")
+              mkdir -p "$BACKUP_DIR/${FINAL_FOLDER_NAME}"
+              echo "${FINAL_FOLDER_NAME}|${FILENAME_NO_EXT}" >> /tmp/folder_map.txt
+
+              TEMP_NAME="media_$$"
+              FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
+
+              if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
+                echo "  Splitting into ${SPLIT_MB}MB parts..."
+                cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+                cd tmp_downloads
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  zip -0 -s "${SPLIT_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+                else
+                  zip -0 -s "${SPLIT_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+                fi
+                for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                  [ -f "$part" ] || continue
+                  PART_EXT="${part##*.}"
+                  mv "$part" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${PART_EXT}"
+                done
+                rm -f "${TEMP_NAME}.${EXT}"
+                cd ..
+              elif [ -n "$ZIP_PASSWORD" ]; then
+                cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+                cd tmp_downloads
+                zip -j -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+                mv "${TEMP_NAME}.zip" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip"
+                rm -f "${TEMP_NAME}.${EXT}"
+                cd ..
+              else
+                cp "$FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"
+              fi
+              echo "  Saved to folder: $FINAL_FOLDER_NAME"
+            done
+          else
+            echo "⚠️ No valid files were downloaded!"
+            mkdir -p "$BACKUP_DIR/error_report"
+            echo "Download failed for: $URL" > "$BACKUP_DIR/error_report/error.txt"
+            echo "Time: $(date)" >> "$BACKUP_DIR/error_report/error.txt"
+          fi
+
+          rm -rf tmp_downloads
           
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: instagram-content
-          path: downloads/instagram/
-          retention-days: 7
+          echo ""
+          echo "========================================="
+          echo "Backup directory contents:"
+          find "$BACKUP_DIR" -type f | head -20
+          echo "========================================="
+
+      - name: Stop WARP Container
+        if: always()
+        run: |
+          docker stop warp || true
+          docker rm warp || true
+
+      - name: Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          BACKUP_FILE_COUNT=$(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l)
+
+          if [ "$BACKUP_FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: No files in backup directory!"
+            exit 1
+          fi
+
+          mkdir -p instagram
+          cp -r "$BACKUP_DIR"/* instagram/ 2>/dev/null || true
+          git add -A instagram/
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: add instagram content [skip ci]"
+            git push origin HEAD:"$BRANCH" || {
+              git fetch origin "$BRANCH"
+              git rebase origin/"$BRANCH"
+              git push origin HEAD:"$BRANCH"
+            }
+            echo "✅ Changes committed and pushed"
+          else
+            echo "No new changes to commit"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          URL="${{ github.event.inputs.instagram_url }}"
+          TAG="instagram-$(date +%Y%m%d-%H%M%S)"
+
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          
+          # پیدا کردن فایل‌های دانلود شده
+          if [ -d "$BACKUP_DIR" ] && [ "$(ls -A $BACKUP_DIR)" ]; then
+            FIRST_FOLDER=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+            if [ -n "$FIRST_FOLDER" ]; then
+              RELEASE_TITLE="Instagram: $(basename "${FIRST_FOLDER}")"
+            else
+              RELEASE_TITLE="Instagram Download $(date +%Y%m%d-%H%M%S)"
+            fi
+          else
+            RELEASE_TITLE="Instagram Download Failed - $(date +%Y%m%d-%H%M%S)"
+          fi
+
+          {
+            echo "## محتوای دانلود شده از اینستاگرام"
+            echo ""
+            echo "**لینک اصلی:** $URL"
+            echo ""
+            echo "---"
+            echo ""
+            
+            if [ -d "$BACKUP_DIR" ]; then
+              for folder in "$BACKUP_DIR"/*/; do
+                [ -d "$folder" ] || continue
+                FOLDER_NAME=$(basename "$folder")
+                echo "### $FOLDER_NAME"
+                echo ""
+                echo "| فایل | لینک دانلود |"
+                echo "|------|-------------|"
+                
+                for file in "$folder"/*; do
+                  [ -f "$file" ] || continue
+                  FILE_NAME=$(basename "$file")
+                  ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$FILE_NAME'))")
+                  ENCODED_FOLDER=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$FOLDER_NAME'))")
+                  RAW_LINK="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/instagram/${ENCODED_FOLDER}/${ENCODED_NAME}"
+                  echo "| \`$FILE_NAME\` | [دانلود]($RAW_LINK) |"
+                done
+                echo ""
+              done
+            else
+              echo "❌ هیچ فایلی دانلود نشد!"
+            fi
+          } > /tmp/release_notes.md
+
+          gh release create "$TAG" \
+            --title "$RELEASE_TITLE" \
+            --notes-file /tmp/release_notes.md \
+            --repo "${REPO_OWNER}/${REPO_NAME}" || echo "Release creation failed, but continuing..."
+
+          echo "Release created: $TAG"
